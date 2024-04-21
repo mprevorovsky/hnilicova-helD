@@ -1,0 +1,14 @@
+sample_ID	bam_file	cultivation_run	genotype	phase
+WT_EXP_1	1-wt-ex1_S1_merged_R1_001.fastq.gz.trim.fastq.gz.bam	1	WT	EXP
+helD_KO_EXP_3	10-deltahelD-ex3_S10_merged_R1_001.fastq.gz.trim.fastq.gz.bam	3	helD_KO	EXP
+WT_STAT_3	11-wt-st3_S11_merged_R1_001.fastq.gz.trim.fastq.gz.bam	3	WT	STAT
+helD_KO_STAT_3	12-deltahelD-st3_S12_merged_R1_001.fastq.gz.trim.fastq.gz.bam	3	helD_KO	STAT
+helD_KO_EXP_1	2-deltahelD-ex1_S2_merged_R1_001.fastq.gz.trim.fastq.gz.bam	1	helD_KO	EXP
+WT_STAT_1	3-wt-st1_S3_merged_R1_001.fastq.gz.trim.fastq.gz.bam	1	WT	STAT
+helD_KO_STAT_1	4-deltahelD-st1_S4_merged_R1_001.fastq.gz.trim.fastq.gz.bam	1	helD_KO	STAT
+WT_EXP_2	5-wt-ex2_S5_merged_R1_001.fastq.gz.trim.fastq.gz.bam	2	WT	EXP
+helD_KO_EXP_2	6-deltahelD-ex2_S6_merged_R1_001.fastq.gz.trim.fastq.gz.bam	2	helD_KO	EXP
+WT_STAT_2	7-wt-st2_S7_merged_R1_001.fastq.gz.trim.fastq.gz.bam	2	WT	STAT
+helD_KO_STAT_2	8-deltahelD-st2_S8_merged_R1_001.fastq.gz.trim.fastq.gz.bam	2	helD_KO	STAT
+WT_EXP_3	9-wt-ex3_S9_merged_R1_001.fastq.gz.trim.fastq.gz.bam	3	WT	EXP
+

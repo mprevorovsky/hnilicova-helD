@@ -1,0 +1,618 @@
+---
+title: "RNA-seq of WT vs helD knock-out in Mycobacterium smegmatis"
+author: "Martin Převorovský, prevorov@natur.cuni.cz, http://www.GenoMik.cz"
+output: html_document
+---
+
+The main aims of this experiment are to:
+
+* identify genes whose expression levels change in response to presence/absence of HelD (MSMEG_2174) in both exponential and stationary phase of growth
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rtracklayer)
+library(GenomicAlignments)
+library(GenomicFeatures)
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+
+genome_dir <- './genome_Msmegmatis/'
+genome_annot <- paste0(genome_dir, 'GCF_000015005.1_ASM1500v1_genomic.customized.gff')
+bam_dir <- './BAM_RNA-seq_Msmegmatis/'
+coverage_dir <- './coverage_RNA-seq_Msmegmatis/'
+deg_dir <- './DEG_RNA-seq_Msmegmatis/'
+image_dir <- './images_Msmegmatis/'
+```
+
+Variables for shell scripts are stored in the file "shell_variables_RNA-seq_Msmegmatis.sh" and can be modified as needed:
+
+```{bash list_variables}
+cat shell_variables_RNA-seq_Msmegmatis.sh
+```
+
+
+# *Mycobacterium smegmatis* MC2 155 genome sequence and annotation
+
+* genome sequence used: gi|118467340|ref|NC_008596.1|
+
+* genome annotation used: genome-build-accession NCBI_Assembly:GCF_000015005.1
+
+* GFF annotation was edited to include the Ms1 ncRNA and the rnpB genes
+
+* spike sequences added to the genome (the 4-spike mix was used)
+
+```{bash, message=FALSE, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+zcat "${genome_dir}GCF_000015005.1_ASM1500v1_genomic.gff.gz" > "${genome_annot}"
+sed -i 's/NC_008596.1/gi|118467340|ref|NC_008596.1|/g' "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tgene\t4392642\t4392993\t.\t-\t.\tID=gene99998;locus_tag=rnpB;gene=rnpB;Name=MSMEG_rnpB" >> "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tCDS\t4392642\t4392993\t.\t-\t0\tID=cds99998;Parent=gene99998;locus_tag=rnpB" >> "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tgene\t6242368\t6242672\t.\t+\t.\tID=gene99999;locus_tag=Ms1;gene=Ms1;Name=MSMEG_Ms1" >> "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tCDS\t6242368\t6242672\t.\t+\t0\tID=cds99999;Parent=gene99999;locus_tag=Ms1" >> "${genome_annot}"
+
+cat "${genome/\.fasta/_no_spikes\.fasta}" ./spikes_4.fasta > "${genome}"
+
+samtools faidx "${genome}"
+cut -f1,2 "${genome}.fai" > "${genome_dir}chrom.sizes"
+```
+
+```{r, eval=TRUE}
+gff <- import.gff3(genome_annot)
+gff.genes <- gff[gff$type == 'gene', ]
+gff.genes <- gff.genes[order(start(gff.genes)), ]
+export.gff3(gff.genes, paste0(genome_dir, 'Msmegmatis_genes.gff'))
+```
+
+```{bash}
+bedtools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+bedtools complement -i "${genome_dir}Msmegmatis_genes.gff" -g "${genome_dir}chrom.sizes" > "${genome_dir}Msmegmatis_intergenic.bed"
+```
+
+```{r, eval=TRUE}
+intergenic <- import.bed(paste0(genome_dir, 'Msmegmatis_intergenic.bed'))
+intergenic$source <- 'custom'
+intergenic$type <- 'IGR'
+for (i in 1:length(intergenic)){
+  down <- gff.genes[which(end(gff.genes) + 1 == start(intergenic)[i]), ]
+  up <- gff.genes[which(start(gff.genes) - 1 == end(intergenic)[i]), ]
+  mcols(intergenic)[i, 'locus_tag'] <- paste('IGR', down$locus_tag, up$locus_tag, sep = '_')
+}
+export.gff3(intergenic, paste0(genome_dir, 'Msmegmatis_intergenic.gff'))
+```
+
+
+# QC of raw sequence reads
+
+* Libraries were sequenced at the Institute of Molecular Genetics, Czech Academy of Sciences, Prague (Illumina NextSeq 550).
+
+* Technical quality of library construction and sequencing run was tested using `fastQC`.
+
+```{bash}
+fastqc --version
+multiqc --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+mkdir -p "${QC_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+  fastqc --quiet --outdir "${QC_dir}" --threads "${CPU}" "${fastq_dir}${i}"
+done
+
+multiqc -f -m fastqc -i RNA-seq_Msmegmatis -o "${QC_dir}" "${QC_dir}"
+```
+
+Results of QC:
+
+* 86 nt SE reads
+
+* 11.6-15.6 M reads per sample
+
+* read quality scores somewhat deteriorate at the end → 3' end trimming of reads is needed
+
+* all samples give error on per base sequence content (due to random priming)
+
+* all samples give error/warning on per sequence GC content (could be due to extremely high expression of some RNAs, such as Ms1 in stationary phase). GC profiles do not cluster by genotype or growth phase! 
+
+* all samples give error on high read duplication levels (normal and OK for transcriptome analysis)
+
+* all samples give error/warning on overrepresented sequences
+
+* no adapter contamination
+
+
+# Read trimming
+
+* trim parts of the reads where average base quality in a 4 nt window drops below 20
+
+* only keep trimmed reads that are at least 20 nt long
+
+* adapter trimming not needed
+
+```{bash}
+java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar -version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+mkdir -p "${fastq_trim_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+  java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar SE -phred33 -threads "${CPU}" "${fastq_dir}${i}" "${fastq_trim_dir}${i}.trim.fastq.gz" SLIDINGWINDOW:4:20 MINLEN:20
+done
+```
+
+
+# QC of quality-trimmed sequence reads
+
+Effects of trimming were determined by `fastQC`.
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+mkdir -p "${QC_trim_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_trim_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+  fastqc --quiet --outdir "${QC_trim_dir}" --threads "${CPU}" "${fastq_trim_dir}${i}"
+done
+
+multiqc -f -m fastqc -i RNA-seq_Msmegmatis_trimmed -o "${QC_trim_dir}" "${QC_trim_dir}"
+```
+
+Results of QC:
+
+* dropped <2% of reads
+
+* 20-86 nt reads (vast majority of reads are >82 nt)
+
+* read quality scores now OK
+
+
+# Read mapping into *M. smegmatis* genome
+
+```{bash}
+hisat2 --version
+samtools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+# build HISAT2 index
+hisat2-build --quiet -p "${CPU}" "${genome}" "${genome}"
+
+# map
+mkdir -p "${bam_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_trim_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+	infile="${fastq_trim_dir}${i}"
+	outfile="${bam_dir}${i}.bam"
+  echo "${outfile}"
+	hisat2 -x "${genome}" -U "${infile}" --threads "${CPU}" --no-spliced-alignment -k 10 --summary-file "${outfile}.log" | samtools view -b -F 256 --threads "${CPU}" - | samtools sort --threads "${CPU}" -o "${outfile}" - 
+	samtools index "${outfile}"
+	samtools view -c --threads "${CPU}" "${outfile}"
+done
+```
+
+Notes
+
+* To properly map reads coming from repeat regions (e.g., rRNA), HISAT was set to search for up to 10 matching positions, then only the best (marked as primary by HISAT) alignment was kept.
+
+	* **The kit used for sequencing library preparation produces reads that are reverse-complement to the original RNA sequence. Therefore, reads map to the opposite strand compared to the corresponding gene's orientation. This needs to be accounted for during count table generation (reads are reversed) and generation of strand-specific BAM and BigWig files (plus-strand reads are used for computing real minus-strand coverage, and vice versa).**
+	
+* Mapping rate >94%, but 1 sample had only ~85% (HelD-null-st-2).
+
+
+# Create genome coverage files for each sample 
+
+* Note that strand polarity is swapped during the calculation (sequencing libraries are reverse-complement of the original RNA).
+
+```{bash}
+deeptools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+mkdir -p "${coverage_dir}"
+mapfile -t bam_files < <(ls -1 "${bam_dir}" | grep "\.bam$")
+for i in ${!bam_files[@]};
+do
+  scaling_factor=`samtools idxstats "${bam_dir}${bam_files[${i}]}" | head -n 5 | cut -f3 | paste -s -d+ | bc`
+  scaling_factor=`echo "scale=6; 1/(${scaling_factor}/1000000)" | bc`
+	input_file="${bam_dir}${bam_files[${i}]}"
+	bamCoverage --binSize "${bin_size}" -p "${CPU}" --bam "${input_file}" -o "${coverage_dir}${bam_files[${i}]}.bw" --scaleFactor "${scaling_factor}"
+	bamCoverage --binSize "${bin_size}" -p "${CPU}" --bam "${input_file}" -o "${coverage_dir}${bam_files[${i}]}.plus.bw" --scaleFactor "${scaling_factor}" --samFlagInclude 16
+	scaling_factor=`echo "${scaling_factor}*-1" | bc`
+	bamCoverage --binSize "${bin_size}" -p "${CPU}" --bam "${input_file}" -o "${coverage_dir}${bam_files[${i}]}.minus.bw" --scaleFactor "${scaling_factor}" --samFlagExclude 16
+done
+```
+
+Notes
+
+* Checked all samples visually in IGV. Sample "HelD-null-ex-2_S5" looks like WT - has level of helD coverage similar to WT!
+
+* Most reads come from the MSMEG_2093 (rna10) locus. Many reads from Ms1 and rnpB loci.
+
+* rRNA reads clearly present, but quantity looks reasonable.
+
+
+# Determine rRNA content
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+rRNA_1='gi|118467340|ref|NC_008596.1|:3819833-3825494'
+rRNA_2='gi|118467340|ref|NC_008596.1|:5024129-5031105'
+
+bam_files=( $(ls -1 -d "${bam_dir}"* | grep "\.bam$") )
+
+echo -e "file\tall\tmapped\tunmapped\trRNA\tother_mapped" > rRNA_read_counts_Msmegmatis
+for i in ${bam_files[@]};
+do
+  all_reads=`samtools view -c "${i}"`
+  mapped_reads=`samtools view -c -F 4 "${i}"`
+  unmapped_reads=`samtools view -c -f 4 "${i}"`
+  rRNA_reads=`samtools view -c "${i}" "${rRNA_1}" "${rRNA_2}"`
+  other_mapped_reads=`echo "${mapped_reads}-${rRNA_reads}" | bc`
+  echo -e "${i/$bam_dir/}\t${all_reads}\t${mapped_reads}\t${unmapped_reads}\t${rRNA_reads}\t${other_mapped_reads}" >> rRNA_read_counts_Msmegmatis
+done
+```
+
+Notes
+
+* rRNA content among mapped reads is 1.7-8%
+
+
+# Determine spike-in content
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_Msmegmatis.sh
+
+spikes=("Plat" "Mos" "Elav2" "Nluc")
+
+bam_files=( $(ls -1 -d "${bam_dir}"* | grep "\.bam$") )
+
+echo -e "file\tall\tmapped\tunmapped\tspikes\tother_mapped" > spike-in_read_counts_Msmegmatis
+for i in ${bam_files[@]};
+do
+  all_reads=`samtools view -c "${i}"`
+  mapped_reads=`samtools view -c -F 4 "${i}"`
+  unmapped_reads=`samtools view -c -f 4 "${i}"`
+  spike_reads=`samtools view -c "${i}" "${spikes[@]}"`
+  other_mapped_reads=`echo "${mapped_reads}-${spike_reads}" | bc`
+  echo -e "${i/$bam_dir/}\t${all_reads}\t${mapped_reads}\t${unmapped_reads}\t${spike_reads}\t${other_mapped_reads}" >> spike-in_read_counts_Msmegmatis
+done
+```
+
+Notes
+
+* Spikes constitute ~1.1-1.5% of mapped reads in most samples.
+
+* Spike reads in samples "HelD-null-ex-2_S5" and "HelD-null-st-2_S6" represent ~37% and ~24% of mapped reads!
+
+
+# Create count tables 
+
+## for all genes
+
+```{r, eval=TRUE}
+gff <- import.gff3(genome_annot)
+gff.genes <- gff[gff$type == 'gene', ]
+
+# process the current sequencing run
+sample_info <- read.delim('sampleInfo_RNA-seq_Msmegmatis', stringsAsFactors = FALSE, header = TRUE, sep = '\t')
+sample_info[, 'cultivation_run'] <- factor(sample_info[, 'cultivation_run'])
+sample_info[, 'genotype'] <- factor(sample_info[, 'genotype'])
+sample_info[, 'phase'] <- factor(sample_info[, 'phase'])
+
+bam <- BamFileList(list.files(bam_dir, 
+                              pattern = '\\.bam$', 
+                              full.names = TRUE),
+                   asMates = FALSE,
+                   yieldSize = 1000000)
+names(bam) <- sample_info$sample_ID
+
+se <- summarizeOverlaps(features = gff.genes,
+                        reads = bam,
+                        mode = 'Union',
+                        singleEnd = TRUE,
+                        ignore.strand = FALSE,
+                        preprocess.reads = invertStrand)
+rownames(se) <- gff.genes$locus_tag
+colData(se) <- cbind(colData(se), sample_info)
+save(file = 'se_RNA-seq_Msmegmatis.rda', se)
+
+# re-process the previous sequencing run 
+sample_info2 <- read.delim('./../20220324_RNA-seq+ChIP-seq+RIP-seq/sampleInfo', stringsAsFactors = FALSE, header = TRUE, sep = '\t')
+sample_info2[, 'cultivation_run'] <- factor(sample_info2[, 'cultivation_run'])
+sample_info2[, 'genotype'] <- factor(sample_info2[, 'genotype'])
+sample_info2[, 'phase'] <- factor(sample_info2[, 'phase'])
+sample_info2[, 'sample_ID'] <- paste(sample_info2[, 'sample_ID'], "r1", sep = '_')
+
+bam2 <- BamFileList(list.files('./../20220324_RNA-seq+ChIP-seq+RIP-seq/BAM_RNA-seq_Msmegmatis/', 
+                               pattern = '\\.bam$', 
+                               full.names = TRUE),
+                    asMates = FALSE,
+                    yieldSize = 1000000)
+names(bam2) <- sample_info2$sample_ID
+
+se2 <- summarizeOverlaps(features = gff.genes,
+                         reads = bam2,
+                         mode = 'Union',
+                         singleEnd = TRUE,
+                         ignore.strand = FALSE,
+                         preprocess.reads = invertStrand)
+rownames(se2) <- gff.genes$locus_tag
+colData(se2) <- cbind(colData(se2), sample_info2)
+save(file = 'se_RNA-seq_Msmegmatis_r1.rda', se2)
+
+#load('se_RNA-seq_Msmegmatis.rda')
+#load('se_RNA-seq_Msmegmatis_r1.rda')
+se.all <- cbind(se, se2)
+
+# normalize to get TPM values (transcripts per million)
+counts <- assay(se.all)
+gene_widths <- width(gff.genes)
+counts.norm <- counts
+for (i in 1:nrow(counts.norm)){
+  counts.norm[i, ] <- counts.norm[i, ] / gene_widths[i]
+}
+count_sums <- colSums(counts.norm) / 1000000
+for (i in 1:length(count_sums)){
+  counts.norm[, i] <- counts.norm[, i] / count_sums[i]
+}
+
+counts <- cbind(gff.genes$Name, counts)
+counts.norm <- cbind(gff.genes$Name, counts.norm)
+colnames(counts)[1] <- 'gene_name'
+colnames(counts.norm)[1] <- 'gene_name'
+write.csv(counts, file ='counts_RNA-seq_Msmegmatis.csv', quote = FALSE)
+write.csv(counts.norm, file ='counts_RNA-seq.TPM-normalized_Msmegmatis.csv', quote = FALSE)
+rm(gene_widths, count_sums)
+```
+
+## for all intergenic regions
+
+```{r, eval=TRUE}
+intergenic <- import.gff3(paste0(genome_dir, 'Msmegmatis_intergenic.gff'))
+
+# process the current sequencing run
+se.intergenic <- summarizeOverlaps(features = intergenic,
+                                   reads = bam,
+                                   mode = 'Union',
+                                   singleEnd = TRUE,
+                                   ignore.strand = FALSE,
+                                   preprocess.reads = invertStrand)
+rownames(se.intergenic) <- intergenic$locus_tag
+save(se.intergenic, file = 'se_intergenic_Msmegmatis.rda')
+
+# re-process the previous sequencing run 
+se2.intergenic <- summarizeOverlaps(features = intergenic,
+                                    reads = bam2,
+                                    mode = 'Union',
+                                    singleEnd = TRUE,
+                                    ignore.strand = FALSE,
+                                    preprocess.reads = invertStrand)
+rownames(se2.intergenic) <- intergenic$locus_tag
+save(se2.intergenic, file = 'se_intergenic_Msmegmatis_r1.rda')
+
+
+#load(file = 'se_intergenic_Msmegmatis.rda')
+#load(file = 'se_intergenic_Msmegmatis_r1.rda')
+se.intergenic.all <- cbind(se.intergenic, se2.intergenic)
+
+# normalize to get TPM values (transcripts per million)
+counts.intergenic <- assay(se.intergenic.all)
+gene_widths.intergenic <- width(intergenic)
+counts.intergenic.norm <- counts.intergenic
+for (i in 1:nrow(counts.intergenic.norm)){
+  counts.intergenic.norm[i, ] <- counts.intergenic.norm[i, ] / gene_widths.intergenic[i]
+}
+count_sums.intergenic <- colSums(counts.intergenic.norm) / 1000000
+for (i in 1:length(count_sums.intergenic)){
+  counts.intergenic.norm[, i] <- counts.intergenic.norm[, i] / count_sums.intergenic[i]
+}
+
+write.csv(counts.intergenic, file ='counts_RNA-seq_intergenic_Msmegmatis.csv', quote = FALSE)
+write.csv(counts.intergenic.norm, file ='counts_RNA-seq_intergenic.TPM-normalized_Msmegmatis.csv', quote = FALSE)
+rm(gene_widths.intergenic, count_sums.intergenic)
+```
+
+
+## QC of count table data
+
+```{r, eval=TRUE}
+dir.create(image_dir, showWarnings = FALSE)
+
+dds <- DESeqDataSet(se.all, 
+                    design = ~ cultivation_run + 
+                      genotype +
+                      phase)
+dds <- DESeq(dds)
+rld <- rlog(dds, blind = FALSE)
+
+sampleDists <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- rld$sample_ID
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pdf(paste0(image_dir, 'heatmap_RNA-seq_sampleDist_rlog_Msmegmatis.pdf'))
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+dev.off()
+
+pdf(paste0(image_dir, 'PCA_RNA-seq_rlog_Msmegmatis.pdf'))
+plotPCA(rld, intgroup = c('genotype', 'phase', 'cultivation_run'))
+plotPCA(rld, intgroup = 'genotype')
+plotPCA(rld, intgroup = 'phase')
+plotPCA(rld, intgroup = 'cultivation_run')
+dev.off()
+```
+
+* Heatmap results - samples cluster by growth phase, as expected, with the exception of sample helD_KO_EXP_2 (HelD-null-ex-2_S5) and helD_KO_EXP_2_r1, which look like STAT phase samples.
+
+* PCA results - STAT and EXP samples form two closely related clusters each (mild batch effects). Again, the suspicious helD_KO_EXP samples from replicate 2 cluster with STAT-phase samples. Thus, the problem with sample identity in replicate 2 has not been solved.
+
+
+# DEG calling
+
+```{r, eval=TRUE}
+# Benjamini-Hochberg p value adjustment (FDR)
+padj_threshold <- 0.05
+
+dir.create(deg_dir)
+
+# helD-EXP vs WT-EXP replicates 1+3+4
+dds <- DESeqDataSet(se.all, design = ~ cultivation_run + genotype)
+dds <- dds[, dds$cultivation_run != 2] # remove replicate 2
+dds <- dds[, dds$phase == 'EXP'] # remove STAT samples
+dds$phase <- droplevels(dds$phase) # remove factor levels without samples
+dds$cultivation_run <- droplevels(dds$cultivation_run) # remove factor levels without samples
+dds$genotype <- relevel(dds$genotype, ref = 'WT') # change order of factor levels to get helD_KO/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_helD-EXP_vs_WT-EXP_reps1+3+4.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_helD-EXP_vs_WT-EXP_reps1+3+4.SIG.csv'), quote = FALSE)
+
+# helD-STAT vs WT-STAT replicates 1+3+4
+dds <- DESeqDataSet(se.all, design = ~ cultivation_run + genotype)
+dds <- dds[, dds$cultivation_run != 2] # remove replicate 2
+dds <- dds[, dds$phase == 'STAT'] # remove EXP samples
+dds$phase <- droplevels(dds$phase) # remove factor levels without samples
+dds$cultivation_run <- droplevels(dds$cultivation_run) # remove factor levels without samples
+dds$genotype <- relevel(dds$genotype, ref = 'WT') # change order of factor levels to get helD_KO/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_helD-STAT_vs_WT-STAT_reps1+3+4.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_helD-STAT_vs_WT-STAT_reps1+3+4.SIG.csv'), quote = FALSE)
+
+# helD-STAT vs WT-STAT replicates 1+2+3+4
+dds <- DESeqDataSet(se.all, design = ~ cultivation_run + genotype)
+dds <- dds[, dds$phase == 'STAT'] # remove EXP samples
+dds$phase <- droplevels(dds$phase) # remove factor levels without samples
+dds$genotype <- relevel(dds$genotype, ref = 'WT') # change order of factor levels to get helD_KO/WT fold change (= define the reference)
+dds <- DESeq(dds)
+res <- results(dds, alpha = padj_threshold)
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_helD-STAT_vs_WT-STAT_reps1+2+3+4.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_helD-STAT_vs_WT-STAT_reps1+2+3+4.SIG.csv'), quote = FALSE)
+```
+
+
+## Global RNA level comparisons
+
+Since only very few DEGs have been identified, it is possible that the absence of helD has a global effect on the transcriptome, affecting RNA levels for many/most genes. Such a situation would not be recognizable by DESeq2 (the global shift in RNA levels would be normalized out) and RNA levels need to be normalized to the spike-in controls instead.
+
+```{r, eval=TRUE}
+spikes <- read.delim('spike-in_read_counts_Msmegmatis', header = TRUE, stringsAsFactors = FALSE)
+spikes$ratio <- spikes$spikes / spikes$mapped
+spikes <- cbind(spikes, sample_info)
+
+spikes2 <- read.delim('./../20220324_RNA-seq+ChIP-seq+RIP-seq/spike-in_read_counts_Msmegmatis', header = TRUE, stringsAsFactors = FALSE)
+spikes2$ratio <- spikes2$spikes / spikes2$mapped
+spikes2 <- cbind(spikes2, sample_info2)
+
+spikes.all <- rbind(spikes, spikes2)
+
+counts.spike_norm <- as.data.frame(counts)
+for (i in 2:ncol(counts.spike_norm)) {
+  counts.spike_norm[, i] <- as.numeric(counts.spike_norm[, i]) / spikes.all[i - 1, 'ratio']
+}
+
+counts.spike_norm.ratios <- data.frame(EXP_1 = counts.spike_norm$helD_KO_EXP_1_r1 / counts.spike_norm$WT_EXP_1_r1,
+                                       EXP_3 = counts.spike_norm$helD_KO_EXP_3_r1 / counts.spike_norm$WT_EXP_3_r1,
+                                       EXP_4 = counts.spike_norm$helD_KO_EXP_4 / counts.spike_norm$WT_EXP_4,
+                                       STAT_1 = counts.spike_norm$helD_KO_STAT_1_r1 / counts.spike_norm$WT_STAT_1_r1,
+                                       STAT_2 = counts.spike_norm$helD_KO_STAT_2_r1 / counts.spike_norm$WT_STAT_2_r1,
+                                       STAT_3 = counts.spike_norm$helD_KO_STAT_3_r1 / counts.spike_norm$WT_STAT_3_r1,
+                                       STAT_4 = counts.spike_norm$helD_KO_STAT_4 / counts.spike_norm$WT_STAT_4)
+
+boxplot(log2(counts.spike_norm.ratios),
+        las = 2,
+        ylab = 'log2(expression ratio)',
+        ylim = c(-3, 3))
+abline(h = 0, col = 'blue')
+
+
+
+
+
+
+
+spikes <- read.delim('spike-in_read_counts_Msmegmatis', header = TRUE, stringsAsFactors = FALSE)
+spikes <- cbind(spikes, sample_info)
+
+spikes2 <- read.delim('./../20220324_RNA-seq+ChIP-seq+RIP-seq/spike-in_read_counts_Msmegmatis', header = TRUE, stringsAsFactors = FALSE)
+spikes2 <- cbind(spikes2, sample_info2)
+
+spikes.all <- rbind(spikes, spikes2)
+
+counts.spike_norm <- as.data.frame(counts)
+for (i in 2:ncol(counts.spike_norm)) {
+  counts.spike_norm[, i] <- as.numeric(counts.spike_norm[, i]) / spikes.all[i - 1, 'spikes']
+}
+
+counts.spike_norm.ratios <- data.frame(EXP_1 = counts.spike_norm$helD_KO_EXP_1_r1 / counts.spike_norm$WT_EXP_1_r1,
+                                       EXP_3 = counts.spike_norm$helD_KO_EXP_3_r1 / counts.spike_norm$WT_EXP_3_r1,
+                                       EXP_4 = counts.spike_norm$helD_KO_EXP_4 / counts.spike_norm$WT_EXP_4,
+                                       STAT_1 = counts.spike_norm$helD_KO_STAT_1_r1 / counts.spike_norm$WT_STAT_1_r1,
+                                       STAT_2 = counts.spike_norm$helD_KO_STAT_2_r1 / counts.spike_norm$WT_STAT_2_r1,
+                                       STAT_3 = counts.spike_norm$helD_KO_STAT_3_r1 / counts.spike_norm$WT_STAT_3_r1,
+                                       STAT_4 = counts.spike_norm$helD_KO_STAT_4 / counts.spike_norm$WT_STAT_4)
+
+pdf(paste0(image_dir, 'spike-normalized_expression_ratios.pdf'))
+boxplot(log2(counts.spike_norm.ratios),
+        main = 'helD_KO / WT (spike-normalized)',
+        las = 2,
+        ylab = 'log2(expression ratio)',
+        ylim = c(-3, 3))
+abline(h = 0, col = 'blue')
+dev.off()
+
+t.test(x = c(median(counts.spike_norm.ratios$EXP_1, na.rm = TRUE), 
+         median(counts.spike_norm.ratios$EXP_2, na.rm = TRUE), 
+         median(counts.spike_norm.ratios$EXP_3, na.rm = TRUE)), 
+       y = c(median(counts.spike_norm.ratios$STAT_1, na.rm = TRUE), 
+             median(counts.spike_norm.ratios$STAT_2, na.rm = TRUE), 
+             median(counts.spike_norm.ratios$STAT_3, na.rm = TRUE), 
+             median(counts.spike_norm.ratios$STAT_4, na.rm = TRUE)),
+       paired = FALSE,
+       alternative = 'two.sided')
+```
+
+***
+
+```{r}
+sessionInfo()
+```

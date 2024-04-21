@@ -1,0 +1,8 @@
+sample_ID	bam_file	cultivation_run	genotype	phase
+helD_KO_EXP_2	HelD-null-ex-2_S5_merged_R1_001.fastq.gz.trim.fastq.gz.bam	2	helD_KO	EXP
+helD_KO_EXP_4	HelD-null-ex-4_S2_merged_R1_001.fastq.gz.trim.fastq.gz.bam	4	helD_KO	EXP
+helD_KO_STAT_2	HelD-null-st-2_S6_merged_R1_001.fastq.gz.trim.fastq.gz.bam	2	helD_KO	STAT
+helD_KO_STAT_4	HelD-null-st-4_S4_merged_R1_001.fastq.gz.trim.fastq.gz.bam	4	helD_KO	STAT
+WT_EXP_4	wt-ex-4_S1_merged_R1_001.fastq.gz.trim.fastq.gz.bam	4	WT	EXP
+WT_STAT_4	wt-st-4_S3_merged_R1_001.fastq.gz.trim.fastq.gz.bam	4	WT	STAT
+

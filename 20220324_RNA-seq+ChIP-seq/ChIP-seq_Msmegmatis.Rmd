@@ -1,0 +1,912 @@
+---
+title: "ChIP-seq of RNAP, sigma factor and KrsL in Mycobacterium smegmatis"
+author: "Martin Převorovský, prevorov@natur.cuni.cz, http://www.GenoMik.cz"
+output: html_document
+---
+
+The main aims of this pilot experiment are to:
+
+* determine localization of RNAP and sigma factor in WT and helD_KO
+
+* determine localization of KrsL (CarD-bound genes?)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rtracklayer)
+library(GenomicAlignments)
+library(GenomicFeatures)
+
+genome_dir <- './genome_Msmegmatis/'
+genome_annot <- paste0(genome_dir, 'GCF_000015005.1_ASM1500v1_genomic.customized.gff')
+bam_dir <- './BAM_ChIP-seq_Msmegmatis/'
+coverage_dir <- './coverage_ChIP-seq_Msmegmatis/'
+peak_dir <- './peaks_ChIP-seq/'
+image_dir <- './images_Msmegmatis/'
+```
+
+Variables for shell scripts are stored in the file "shell_variables_ChIP-seq_Msmegmatis.sh" and can be modified as needed:
+
+```{bash list_variables}
+cat shell_variables_ChIP-seq_Msmegmatis.sh
+```
+
+
+# *Mycobacterium smegmatis* MC2 155 genome sequence and annotation
+
+* genome sequence used: gi|118467340|ref|NC_008596.1|
+
+* genome annotation used: genome-build-accession NCBI_Assembly:GCF_000015005.1 (with 4 added spike sequences used for RNA-seq experiments)
+
+* GFF annotation was edited to include the Ms1 ncRNA and the rnpB genes
+
+```{bash, message=FALSE, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+zcat "${genome_dir}GCF_000015005.1_ASM1500v1_genomic.gff.gz" > "${genome_annot}"
+sed -i 's/NC_008596.1/gi|118467340|ref|NC_008596.1|/g' "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tgene\t4392642\t4392993\t.\t-\t.\tID=gene99998;locus_tag=MSMEG_rnpB;gene=rnpB;Name=rnpB" >> "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tCDS\t4392642\t4392993\t.\t-\t0\tID=cds99998;Parent=gene99998;locus_tag=MSMEG_rnpB" >> "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tgene\t6242368\t6242672\t.\t+\t.\tID=gene99999;locus_tag=MSMEG_Ms1;gene=Ms1;Name=Ms1" >> "${genome_annot}"
+echo -e "gi|118467340|ref|NC_008596.1|\tcustom\tCDS\t6242368\t6242672\t.\t+\t0\tID=cds99999;Parent=gene99999;locus_tag=MSMEG_Ms1" >> "${genome_annot}"
+
+samtools faidx "${genome}"
+cut -f1,2 "${genome}.fai" > "${genome_dir}chrom.sizes"
+```
+
+
+# QC of raw sequence reads
+
+* Libraries were sequenced at the Institute of Molecular Genetics, Czech Academy of Sciences, Prague (Illumina NextSeq 550).
+
+* Technical quality of library construction and sequencing run was tested using `fastQC`.
+
+```{bash}
+fastqc --version
+multiqc --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+mkdir -p "${QC_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+  fastqc --quiet --outdir "${QC_dir}" --threads "${CPU}" "${fastq_dir}${i}"
+done
+
+multiqc -f -m fastqc -i ChIP-seq_Msmegmatis -o "${QC_dir}" "${QC_dir}"
+```
+
+Results of QC:
+
+* 86 nt SE reads
+
+* ~5-20 M reads per sample, but there are outliers: 49.1 M for 24-WT and 0.0273 M for 27-input-wt-ex2-5th
+
+* no adapter contamination (except ~0.2% in sample 22, no need to remove)
+
+* 22 samples give warning/error on per base sequence content (nothing dramatic, only the first cycle seems to be really biased)
+
+* 17 samples give warning/error on per sequence GC content (contamination in 2 samples with errors, which have a clear second peak?). 
+
+* all samples give error/warning on high read duplication levels (normal and OK for ChIP-seq from a small genome)
+
+* 2 samples give warning on overrepresented sequences (adapters in sample 22)
+
+* read quality scores somewhat deteriorate at the end → 3' end trimming of reads is neededm
+
+
+# Read trimming
+
+* trim parts of the reads where average base quality in a 4 nt window drops below 20
+
+* only keep trimmed reads that are at least 20 nt long
+
+* adapter trimming not needed
+
+```{bash}
+java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar -version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+mkdir -p "${fastq_trim_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+  java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar SE -phred33 -threads "${CPU}" "${fastq_dir}${i}" "${fastq_trim_dir}${i}.trim.fastq.gz" SLIDINGWINDOW:4:20 MINLEN:20
+done
+```
+
+
+# QC of quality-trimmed sequence reads
+
+Effects of trimming were determined by `fastQC`.
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+mkdir -p "${QC_trim_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_trim_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+  fastqc --quiet --outdir "${QC_trim_dir}" --threads "${CPU}" "${fastq_trim_dir}${i}"
+done
+
+multiqc -f -m fastqc -i ChIP-seq_Msmegmatis_trimmed -o "${QC_trim_dir}" "${QC_trim_dir}"
+```
+
+Results of QC:
+
+* dropped ~5-9% of reads
+
+* 20-86 nt reads (vast majority of reads are >82 nt)
+
+* read quality scores now OK
+
+
+# Read mapping into *M. smegmatis* genome
+
+```{bash}
+hisat2 --version
+samtools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+# build HISAT2 index
+hisat2-build --quiet -p "${CPU}" "${genome}" "${genome}"
+
+# map
+mkdir -p "${bam_dir}"
+mapfile -t fastq_files < <(ls -1 "${fastq_trim_dir}" | grep "${fastq_file_ext}")
+for i in ${fastq_files[@]};
+do
+	infile="${fastq_trim_dir}${i}"
+	outfile="${bam_dir}${i}.bam"
+  echo "${outfile}"
+	hisat2 -x "${genome}" -U "${infile}" --threads "${CPU}" --no-spliced-alignment -k 10 --summary-file "${outfile}.log" | samtools view -b -F 256 --threads "${CPU}" - | samtools sort --threads "${CPU}" -o "${outfile}" - 
+	samtools index -@ "${CPU}" "${outfile}"
+	samtools view -c --threads "${CPU}" "${outfile}"
+done
+```
+
+Notes
+
+* To properly map reads coming from repeat regions (e.g., rRNA), HISAT was set to search for up to 10 matching positions, then only the best (marked as primary by HISAT) alignment was kept.
+
+* Mapping rate ~90-99%. One outlier (42-RNAP-helD-st2-6th_S34) had just 75% mapping rate. Since the two lowest mapping rates corresponded to samples that failed GC content QC (samples 33 and 42 had clearly two peaks on the GC plot), the low mapping rate was most likely caused by contamination with foreign DNA.
+
+
+# QC of mapped samples
+
+WARNING - completion of this step can take A LOT of time (days...)!
+
+```{bash}
+deeptools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+mkdir -p "${image_dir}"
+bam_files=( $(ls -1 -d "${bam_dir}"* | grep "\.bam$") )
+multiBamSummary bins --binSize "${bin_size}" -p "${CPU}" -o "${bam_dir}${bam_summary_file}" --bamfiles "${bam_files[@]}"
+plotPCA -in "${bam_dir}${bam_summary_file}" -o "${image_dir}ChIP-seq_plotPCA.pdf" --plotWidth 20 --plotHeight 30 --ntop 0
+plotCorrelation -in "${bam_dir}${bam_summary_file}" -o "${image_dir}ChIP-seq_plotCorrelation.pdf" --corMethod pearson --whatToPlot heatmap --removeOutliers
+```
+
+Samples cluster mostly by antibody, input/IP. There are outlier inputs 27 (few reads), 17, 30, 41.
+
+
+# Create genome coverage files for each sample 
+
+```{bash}
+deeptools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+mkdir -p "${coverage_dir}"
+mapfile -t bam_files < <(ls -1 "${bam_dir}" | grep "\.bam$")
+for i in ${!bam_files[@]};
+do
+  scaling_factor=`samtools idxstats "${bam_dir}${bam_files[${i}]}" | head -n 1 | cut -f3`
+  scaling_factor=`echo "scale=6; 1/(${scaling_factor}/1000000)" | bc`
+	input_file="${bam_dir}${bam_files[${i}]}"
+	bamCoverage --binSize "${bin_size}" -p "${CPU}" --bam "${input_file}" -o "${coverage_dir}${bam_files[${i}]}.bw" --scaleFactor "${scaling_factor}"
+done
+```
+
+Notes
+
+* Checked all samples visually in IGV → OK in most cases. Sample 27-input-wt-ex2-5th has very few reads and is not usable.
+
+* Checked helD genotype in all samples → OK.
+
+* Most inputs look similar (except sample 27 with very few reads, and also somewhat sample 41). EXP inputs can be distinguished from STAT inputs.
+
+* anti-FLAG IP from untagged WT strain looks clean
+
+* Biological replicates look similar; one replicate of KrsL IP (sample 44) seems to have a lower IP efficiency (more noise, less smooth coverage)
+
+* KrsL often colocalizes with sigma factor, sometimes with RNAP
+
+* RNAP IPs have lower background compared to sigma factor and KrsL IPs
+
+
+# Peak calling
+
+```{bash}
+macs2 --version
+```
+
+For some biological replicates, the input + IP samples did not actually come from the same biological material (due to preparation of some libraries failed).
+
+So first tested the impact of using unpaired inputs as control for peak calling.
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+gsize=`cat "${genome_dir}chrom.sizes" | head -n1 | cut -f2`
+mkdir -p "${peak_dir}"
+peak_dir_test="${peak_dir}test/"
+mkdir -p "${peak_dir_test}"
+
+# RNAP
+macs2 callpeak --treatment "${bam_dir}35-RNAP-helD-st1-5th_S33_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}17-input-helD-st1-5th_S31_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "RNAP_helD_STAT_1_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}42-RNAP-helD-st2-6th_S34_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}17-input-helD-st1-5th_S31_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "RNAP_helD_STAT_1_2" --keep-dup auto --nomodel
+
+
+macs2 callpeak --treatment "${bam_dir}42-RNAP-helD-st2-6th_S34_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}41-input-helD-st2-6th_S32_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "RNAP_helD_STAT_2_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}35-RNAP-helD-st1-5th_S33_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}41-input-helD-st2-6th_S32_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "RNAP_helD_STAT_2_2" --keep-dup auto --nomodel
+
+
+# SigA
+macs2 callpeak --treatment "${bam_dir}36-sigA-helD-st1-5th_S35_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}17-input-helD-st1-5th_S31_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "SigA_helD_STAT_1_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}43-sigA-helD-st2-6th_S36_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}17-input-helD-st1-5th_S31_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "SigA_helD_STAT_1_2" --keep-dup auto --nomodel
+
+
+macs2 callpeak --treatment "${bam_dir}43-sigA-helD-st2-6th_S36_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}41-input-helD-st2-6th_S32_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "SigA_helD_STAT_2_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}36-sigA-helD-st1-5th_S35_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}41-input-helD-st2-6th_S32_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir_test}" --name "SigA_helD_STAT_2_2" --keep-dup auto --nomodel
+
+
+wc -l "${peak_dir_test}"*.narrowPeak
+
+bedtools intersect -a "${peak_dir_test}RNAP_helD_STAT_1_1_peaks.narrowPeak" -b "${peak_dir_test}RNAP_helD_STAT_1_2_peaks.narrowPeak" | wc -l
+bedtools intersect -a "${peak_dir_test}RNAP_helD_STAT_2_1_peaks.narrowPeak" -b "${peak_dir_test}RNAP_helD_STAT_2_2_peaks.narrowPeak" | wc -l
+
+bedtools intersect -a "${peak_dir_test}SigA_helD_STAT_1_1_peaks.narrowPeak" -b "${peak_dir_test}SigA_helD_STAT_1_2_peaks.narrowPeak" | wc -l
+bedtools intersect -a "${peak_dir_test}SigA_helD_STAT_2_1_peaks.narrowPeak" -b "${peak_dir_test}SigA_helD_STAT_2_2_peaks.narrowPeak" | wc -l
+```
+
+* Visual inspection confirmed that bona-fide true peaks are correctly called irrespective of the input used. Input had only impact on likely false-positive small peaks (noise).
+
+
+Peaks were then called for each IP vs the (numerically) corresponding input sample. This was done individually for each replicate. 
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+gsize=`cat "${genome_dir}chrom.sizes" | head -n1 | cut -f2`
+
+# WT
+## EXP phase - input library for run 2 produced only negligible number of reads -> used input from run 1 for peak calling in both replicates
+### RNAP
+macs2 callpeak --treatment "${bam_dir}14-RNAP-wt-ex1-3rd_S15_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}26-input-wt-ex1-3rd_S13_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_WT_EXP_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}25-RNAP-wt-ex2-2nd_S16_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}26-input-wt-ex1-3rd_S13_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_WT_EXP_2" --keep-dup auto --nomodel
+
+### SigA
+macs2 callpeak --treatment "${bam_dir}37-sigA-wt-ex1-5th_S17_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}26-input-wt-ex1-3rd_S13_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_WT_EXP_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}22-sigA-wt-ex2-6th_S18_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}26-input-wt-ex1-3rd_S13_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_WT_EXP_2" --keep-dup auto --nomodel
+
+## STAT phase
+### RNAP
+macs2 callpeak --treatment "${bam_dir}33-RNAP-wt-st1-5th_S21_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}28-input-wt-st1-5th_S19_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_WT_STAT_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}39-RNAP-wt-st2-6th_S22_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}30-input-wt-st2-6th_S20_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_WT_STAT_2" --keep-dup auto --nomodel
+
+### SigA
+macs2 callpeak --treatment "${bam_dir}34-sigA-wt-st1-5th_S23_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}28-input-wt-st1-5th_S19_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_WT_STAT_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}40-sigA-wt-st2-4th_S24_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}30-input-wt-st2-6th_S20_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_WT_STAT_2" --keep-dup auto --nomodel
+
+
+# helD
+## EXP phase
+### RNAP
+macs2 callpeak --treatment "${bam_dir}18-RNAP-helD-ex1-3rd_S27_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}31-input-helD-ex1-3rd_S25_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_helD_EXP_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}29-RNAP-helD-ex2-2nd_S28_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}32-input-helD-ex2-5th_S26_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_helD_EXP_2" --keep-dup auto --nomodel
+
+### SigA
+macs2 callpeak --treatment "${bam_dir}38-sigA-helD-ex1-5th_S29_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}31-input-helD-ex1-3rd_S25_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_helD_EXP_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}23-sigA-helD-ex2-6th_S30_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}32-input-helD-ex2-5th_S26_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_helD_EXP_2" --keep-dup auto --nomodel
+
+## STAT phase
+### RNAP
+macs2 callpeak --treatment "${bam_dir}35-RNAP-helD-st1-5th_S33_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}17-input-helD-st1-5th_S31_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_helD_STAT_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}42-RNAP-helD-st2-6th_S34_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}41-input-helD-st2-6th_S32_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "RNAP_helD_STAT_2" --keep-dup auto --nomodel
+
+### SigA
+macs2 callpeak --treatment "${bam_dir}36-sigA-helD-st1-5th_S35_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}17-input-helD-st1-5th_S31_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_helD_STAT_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}43-sigA-helD-st2-6th_S36_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}41-input-helD-st2-6th_S32_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "SigA_helD_STAT_2" --keep-dup auto --nomodel
+
+
+# KrsL
+macs2 callpeak --treatment "${bam_dir}20-krsl-ChIP_S41_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}21-krsl-input_S40_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "KrsL_WT_EXP_1" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}44-krsl-ChIP_S44_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}19-krsl-input_S43_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "KrsL_WT_EXP_2" --keep-dup auto --nomodel
+
+macs2 callpeak --treatment "${bam_dir}16-krsl-ChIP_S46_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --control "${bam_dir}15-krsl-input_S45_merged_R1_001.fastq.gz.trim.fastq.gz.bam" --gsize "${gsize}" --outdir "${peak_dir}" --name "KrsL_WT_EXP_3" --keep-dup auto --nomodel
+```
+
+* There were not enough peaks to build a (robust) peak shift model in many samples, so the `--nomodel` parameter was used throughout (extsize value was left default=200, since the fragment size estimated by `macs2` was around 166-208 anyway (for samples with enough peaks to build the shift model)).
+
+
+# Peak filtering
+
+* Identified peaks were then filtered for those called in all biological replicates.
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+# intersect overlapping peaks
+## EXP RNAP and SigA (2 replicates)
+bedtools intersect -a "${peak_dir}RNAP_WT_EXP_1_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_EXP_2_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}RNAP_WT_EXP_peaks.filtered_intersect.narrowPeak"
+
+bedtools intersect -a "${peak_dir}RNAP_helD_EXP_1_peaks.narrowPeak" -b "${peak_dir}RNAP_helD_EXP_2_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}RNAP_helD_EXP_peaks.filtered_intersect.narrowPeak"
+
+bedtools intersect -a "${peak_dir}SigA_WT_EXP_1_peaks.narrowPeak" -b "${peak_dir}SigA_WT_EXP_2_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}SigA_WT_EXP_peaks.filtered_intersect.narrowPeak"
+
+bedtools intersect -a "${peak_dir}SigA_helD_EXP_1_peaks.narrowPeak" -b "${peak_dir}SigA_helD_EXP_2_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}SigA_helD_EXP_peaks.filtered_intersect.narrowPeak"
+
+## STAT RNAP and SigA (2 or 3 replicates)
+bedtools intersect -a "${peak_dir}RNAP_WT_STAT_1_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_STAT_2_peaks.narrowPeak" | bedtools intersect -a stdin -b "./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/STAT_RNAP_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}RNAP_WT_STAT_peaks.filtered_intersect.narrowPeak"
+
+bedtools intersect -a "${peak_dir}RNAP_helD_STAT_1_peaks.narrowPeak" -b "${peak_dir}RNAP_helD_STAT_2_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}RNAP_helD_STAT_peaks.filtered_intersect.narrowPeak"
+
+bedtools intersect -a "${peak_dir}SigA_WT_STAT_1_peaks.narrowPeak" -b "${peak_dir}SigA_WT_STAT_2_peaks.narrowPeak" | bedtools intersect -a stdin -b "./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/STAT_sigma_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}SigA_WT_STAT_peaks.filtered_intersect.narrowPeak"
+
+bedtools intersect -a "${peak_dir}SigA_helD_STAT_1_peaks.narrowPeak" -b "${peak_dir}SigA_helD_STAT_2_peaks.narrowPeak" | bedtools sort -i stdin > "${peak_dir}SigA_helD_STAT_peaks.filtered_intersect.narrowPeak"
+
+## KrsL (3 replicates)
+bedtools intersect -a "${peak_dir}KrsL_WT_EXP_1_peaks.narrowPeak" -b "${peak_dir}KrsL_WT_EXP_2_peaks.narrowPeak" | bedtools intersect -a stdin -b "${peak_dir}KrsL_WT_EXP_3_peaks.narrowPeak" > "${peak_dir}KrsL_WT_EXP_peaks.filtered_intersect.narrowPeak"
+
+
+# merge overlapping peaks (just for info, will not be used for further analyses)
+## EXP RNAP and SigA (2 replicates)
+a=`bedtools intersect -wa -a "${peak_dir}RNAP_WT_EXP_1_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}RNAP_WT_EXP_2_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}RNAP_WT_EXP_peaks.filtered_merge.bed"
+unset a b d
+
+a=`bedtools intersect -wa -a "${peak_dir}RNAP_helD_EXP_1_peaks.narrowPeak" -b "${peak_dir}RNAP_helD_EXP_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}RNAP_helD_EXP_2_peaks.narrowPeak" -b "${peak_dir}RNAP_helD_EXP_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}RNAP_helD_EXP_peaks.filtered_merge.bed"
+unset a b d
+
+a=`bedtools intersect -wa -a "${peak_dir}SigA_WT_EXP_1_peaks.narrowPeak" -b "${peak_dir}SigA_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}SigA_WT_EXP_2_peaks.narrowPeak" -b "${peak_dir}SigA_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}SigA_WT_EXP_peaks.filtered_merge.bed"
+unset a b d
+
+a=`bedtools intersect -wa -a "${peak_dir}SigA_helD_EXP_1_peaks.narrowPeak" -b "${peak_dir}SigA_helD_EXP_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}SigA_helD_EXP_2_peaks.narrowPeak" -b "${peak_dir}SigA_helD_EXP_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}SigA_helD_EXP_peaks.filtered_merge.bed"
+unset a b d
+
+## STAT RNAP and SigA (2 or 3 replicates)
+a=`bedtools intersect -wa -a "${peak_dir}RNAP_WT_STAT_1_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_STAT_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}RNAP_WT_STAT_2_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_STAT_peaks.filtered_intersect.narrowPeak"`
+c=`bedtools intersect -wa -a "./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/STAT_RNAP_peaks.narrowPeak" -b "${peak_dir}RNAP_WT_STAT_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}"$'\n'"${c[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}RNAP_WT_STAT_peaks.filtered_merge.bed"
+unset a b c d
+
+a=`bedtools intersect -wa -a "${peak_dir}RNAP_helD_STAT_1_peaks.narrowPeak" -b "${peak_dir}RNAP_helD_STAT_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}RNAP_helD_STAT_2_peaks.narrowPeak" -b "${peak_dir}RNAP_helD_STAT_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}RNAP_helD_STAT_peaks.filtered_merge.bed"
+unset a b d
+
+a=`bedtools intersect -wa -a "${peak_dir}SigA_WT_STAT_1_peaks.narrowPeak" -b "${peak_dir}SigA_WT_STAT_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}SigA_WT_STAT_2_peaks.narrowPeak" -b "${peak_dir}SigA_WT_STAT_peaks.filtered_intersect.narrowPeak"`
+c=`bedtools intersect -wa -a "./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/STAT_sigma_peaks.narrowPeak" -b "${peak_dir}SigA_WT_STAT_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}"$'\n'"${c[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}SigA_WT_STAT_peaks.filtered_merge.bed"
+unset a b c d
+
+a=`bedtools intersect -wa -a "${peak_dir}SigA_helD_STAT_1_peaks.narrowPeak" -b "${peak_dir}SigA_helD_STAT_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}SigA_helD_STAT_2_peaks.narrowPeak" -b "${peak_dir}SigA_helD_STAT_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}SigA_helD_STAT_peaks.filtered_merge.bed"
+unset a b d
+
+## KrsL (3 replicates)
+a=`bedtools intersect -wa -a "${peak_dir}KrsL_WT_EXP_1_peaks.narrowPeak" -b "${peak_dir}KrsL_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+b=`bedtools intersect -wa -a "${peak_dir}KrsL_WT_EXP_2_peaks.narrowPeak" -b "${peak_dir}KrsL_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+c=`bedtools intersect -wa -a "${peak_dir}KrsL_WT_EXP_3_peaks.narrowPeak" -b "${peak_dir}KrsL_WT_EXP_peaks.filtered_intersect.narrowPeak"`
+d=( "${a[@]}"$'\n'"${b[@]}"$'\n'"${c[@]}" )
+echo "${d[@]}" | bedtools sort -i stdin | bedtools merge -i stdin -c 5,6,9 -o min,distinct,min > "${peak_dir}KrsL_WT_EXP_peaks.filtered_merge.bed"
+unset a b c d
+```
+
+* Adjust q-values and scores in the filtered intersected peaks
+
+As a conservative approach, each final peak is assigned the least significant score/q_value from all replicates.
+
+```{r, eval=TRUE}
+extraCols_narrowPeak <- c(signal_value = "numeric", p_value = "numeric",
+                          q_value = "numeric", summit_offset = "integer")
+
+# EXP RNAP and SigA
+peaks.intersect <- import.bed(paste0(peak_dir, 'RNAP_WT_EXP_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'RNAP_WT_EXP_1_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'RNAP_WT_EXP_2_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'RNAP_WT_EXP_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+
+peaks.intersect <- import.bed(paste0(peak_dir, 'RNAP_helD_EXP_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'RNAP_helD_EXP_1_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'RNAP_helD_EXP_2_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'RNAP_helD_EXP_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+
+peaks.intersect <- import.bed(paste0(peak_dir, 'SigA_WT_EXP_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'SigA_WT_EXP_1_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'SigA_WT_EXP_2_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'SigA_WT_EXP_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+
+peaks.intersect <- import.bed(paste0(peak_dir, 'SigA_helD_EXP_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'SigA_helD_EXP_1_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'SigA_helD_EXP_2_peaks.narrowPeak'),
+                      extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'SigA_helD_EXP_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+
+# STAT RNAP and SigA
+peaks.intersect <- import.bed(paste0(peak_dir, 'RNAP_WT_STAT_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'RNAP_WT_STAT_1_peaks.narrowPeak'), 
+                      extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'RNAP_WT_STAT_2_peaks.narrowPeak'), 
+                      extraCols = extraCols_narrowPeak)
+peaks_3 <- import.bed('./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/STAT_RNAP_peaks.narrowPeak', 
+                      extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2, peaks_3)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'RNAP_WT_STAT_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks_3, peaks, peaks_overlap.tmp)
+
+peaks.intersect <- import.bed(paste0(peak_dir, 'RNAP_helD_STAT_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'RNAP_helD_STAT_1_peaks.narrowPeak'), extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'RNAP_helD_STAT_2_peaks.narrowPeak'), extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'RNAP_helD_STAT_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+
+peaks.intersect <- import.bed(paste0(peak_dir, 'SigA_WT_STAT_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'SigA_WT_STAT_1_peaks.narrowPeak'), 
+                      extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'SigA_WT_STAT_2_peaks.narrowPeak'), 
+                      extraCols = extraCols_narrowPeak)
+peaks_3 <- import.bed('./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/STAT_sigma_peaks.narrowPeak', 
+                      extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2, peaks_3)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'SigA_WT_STAT_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks_3, peaks, peaks_overlap.tmp)
+
+peaks.intersect <- import.bed(paste0(peak_dir, 'SigA_helD_STAT_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'SigA_helD_STAT_1_peaks.narrowPeak'), extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'SigA_helD_STAT_2_peaks.narrowPeak'), extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'SigA_helD_STAT_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+
+# KrsL 
+peaks.intersect <- import.bed(paste0(peak_dir, 'KrsL_WT_EXP_peaks.filtered_intersect.narrowPeak'),
+                              extraCols = extraCols_narrowPeak)
+peaks_1 <- import.bed(paste0(peak_dir, 'KrsL_WT_EXP_1_peaks.narrowPeak'), extraCols = extraCols_narrowPeak)
+peaks_2 <- import.bed(paste0(peak_dir, 'KrsL_WT_EXP_2_peaks.narrowPeak'), extraCols = extraCols_narrowPeak)
+peaks <- c(peaks_1, peaks_2)
+for (i in 1:length(peaks.intersect)){
+  peaks_overlap.tmp <- peaks[to(findOverlaps(peaks.intersect[i], peaks))]
+  peaks.intersect[i]$score <- min(peaks_overlap.tmp$score, na.rm = TRUE)
+  peaks.intersect[i]$q_value <- min(peaks_overlap.tmp$q_value, na.rm = TRUE)
+}
+write.table(data.frame(seqname = seqnames(peaks.intersect),
+                       start = start(peaks.intersect) - 1,
+                       end = end(peaks.intersect), 
+                       name = peaks.intersect$name,
+                       score = peaks.intersect$score,
+                       strand = '.',
+                       q_value = peaks.intersect$q_value),
+            paste0(peak_dir, 'KrsL_WT_EXP_peaks.filtered_intersect.p-value.bed'),
+            col.names = FALSE, row.names = FALSE, quote = FALSE, sep = '\t')
+rm(peaks.intersect, peaks_1, peaks_2, peaks, peaks_overlap.tmp)
+```
+
+
+# Peak analysis
+
+Create a BED file of all ORFs for plotting average-gene coverage profiles.
+
+Create a GFF file for TSS for identification of genes closest to peaks.
+
+Generate list of peak summits for determination of closest genes.
+
+```{r, eval=TRUE}
+gff <- import.gff3(genome_annot)
+gff.CDS <- gff[gff$type == 'CDS', ]
+gff.CDS$score <- 0
+export.bed(gff.CDS, paste0(genome_dir, 'all_ORFs.bed'))
+median(width(gff.CDS))
+
+gff.TSS <- gff[gff$type == 'gene', ] # this dataset is created to preserve locus_tags in the gff subselection
+gff.TSS <- gff.TSS[gff.TSS$ID %in% unlist(gff.CDS$Parent), ]
+end(gff.TSS[strand(gff.TSS) == '+', ]) <- start(gff.TSS[strand(gff.TSS) == '+', ]) + 1
+start(gff.TSS[strand(gff.TSS) == '-', ]) <- end(gff.TSS[strand(gff.TSS) == '-', ]) - 1
+export.gff3(gff.TSS[order(start(gff.TSS)), ], paste0(genome_dir, 'all_TSS.gff3'))
+
+
+samples <- c('RNAP_WT_EXP', 'RNAP_WT_STAT', 'RNAP_helD_EXP', 'RNAP_helD_STAT',
+             'SigA_WT_EXP', 'SigA_WT_STAT', 'SigA_helD_EXP', 'SigA_helD_STAT',
+             'KrsL_WT_EXP')
+for (i in samples){
+  summits <- read.delim(paste0(peak_dir, i, '_peaks.filtered.narrowPeak'), 
+                        stringsAsFactors = FALSE, header = FALSE)
+  summits[, 3] <- summits[, 3] - summits[, 10]
+  summits[, 2] <- summits[, 3] - 1
+  write.table(summits, paste0(peak_dir, i, '_peaks_SUMMITS.filtered.narrowPeak'), 
+              row.names = FALSE, col.names = FALSE, quote = FALSE, sep = '\t')
+}
+```
+
+Find closest downstream ORFs
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+#RNAP
+bedtools closest -t first -a "${peak_dir}RNAP_WT_EXP_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}RNAP_WT_EXP_peaks_CLOSEST.bed"
+bedtools closest -t first -a "${peak_dir}RNAP_helD_EXP_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}RNAP_helD_EXP_peaks_CLOSEST.bed"
+
+bedtools closest -t first -a "${peak_dir}RNAP_WT_STAT_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}RNAP_WT_STAT_peaks_CLOSEST.bed"
+bedtools closest -t first -a "${peak_dir}RNAP_helD_STAT_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}RNAP_helD_STAT_peaks_CLOSEST.bed"
+
+#SigA
+bedtools closest -t first -a "${peak_dir}SigA_WT_EXP_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}SigA_WT_EXP_peaks_CLOSEST.bed"
+bedtools closest -t first -a "${peak_dir}SigA_helD_EXP_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}SigA_helD_EXP_peaks_CLOSEST.bed"
+
+bedtools closest -t first -a "${peak_dir}SigA_WT_STAT_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}SigA_WT_STAT_peaks_CLOSEST.bed"
+bedtools closest -t first -a "${peak_dir}SigA_helD_STAT_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}SigA_helD_STAT_peaks_CLOSEST.bed"
+
+#KrsL
+bedtools closest -t first -a "${peak_dir}KrsL_WT_EXP_peaks.filtered_intersect.p-value.bed" -b "${genome_dir}all_TSS.gff3" > "${peak_dir}KrsL_WT_EXP_peaks_CLOSEST.bed"
+```
+
+Create average-gene coverage profiles
+
+```{r, eval=TRUE}
+genes_RNAP <- read.delim(paste0(peak_dir, 'RNAP_WT_EXP_peaks_CLOSEST.bed'), stringsAsFactors = FALSE, sep = '\t', header = FALSE)
+genes_RNAP <- genes_RNAP[, 16]
+for (i in 1:length(genes_RNAP)){
+     genes_RNAP[i] <- unlist(strsplit(genes_RNAP[i], 'locus_tag='))[2]
+     genes_RNAP[i] <- substr(genes_RNAP[i], 1, nchar(genes_RNAP[i]) - 1)
+}
+
+genes_SigA <- read.delim(paste0(peak_dir, 'SigA_WT_EXP_peaks_CLOSEST.bed'), stringsAsFactors = FALSE, sep = '\t', header = FALSE)
+genes_SigA <- genes_SigA[, 16]
+for (i in 1:length(genes_SigA)){
+     genes_SigA[i] <- unlist(strsplit(genes_SigA[i], 'locus_tag='))[2]
+     genes_SigA[i] <- substr(genes_SigA[i], 1, nchar(genes_SigA[i]) - 1)
+}
+
+genes_HelD <- read.delim('./../20210629_RIP-seq+ChIP-seq/peaks_ChIP-seq/EXP_HelD_peaks_CLOSEST.bed', stringsAsFactors = FALSE, sep = '\t', header = FALSE)
+genes_HelD <- genes_HelD[, 16]
+for (i in 1:length(genes_HelD)){
+     genes_HelD[i] <- unlist(strsplit(genes_HelD[i], 'locus_tag='))[2]
+     genes_HelD[i] <- substr(genes_HelD[i], 1, nchar(genes_HelD[i]) - 1)
+}
+
+genes_RNAP.shared <- genes_RNAP[which(genes_RNAP %in% genes_HelD)]
+genes_RNAP.unique <- genes_RNAP[which(!genes_RNAP %in% genes_HelD)]
+
+genes_SigA.shared <- genes_SigA[which(genes_SigA %in% genes_HelD)]
+genes_SigA.unique <- genes_SigA[which(!genes_SigA %in% genes_HelD)]
+
+gff <- import.gff3(genome_annot)
+gff.genes <- gff[gff$type == 'gene', ]
+gff.genes$score <- 0
+export.bed(gff.genes[which(gff.genes$locus_tag %in% genes_RNAP.shared), ], paste0(genome_dir, 'RNAP_target_ORFs_shared_w_HelD.bed'))
+export.bed(gff.genes[which(gff.genes$locus_tag %in% genes_RNAP.unique), ], paste0(genome_dir, 'RNAP_target_ORFs_unique.bed'))
+export.bed(gff.genes[which(gff.genes$locus_tag %in% genes_SigA.shared), ], paste0(genome_dir, 'SigA_target_ORFs_shared_w_HelD.bed'))
+export.bed(gff.genes[which(gff.genes$locus_tag %in% genes_SigA.unique), ], paste0(genome_dir, 'SigA_target_ORFs_unique.bed'))
+```
+
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+mkdir -p "${image_dir}"
+
+# whole genes
+computeMatrix scale-regions -S "${coverage_dir}20-krsl-ChIP_S41_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}44-krsl-ChIP_S44_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}16-krsl-ChIP_S46_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" -R "${genome_dir}all_ORFs.bed" --beforeRegionStartLength 1000 --regionBodyLength 850 --afterRegionStartLength 1000 --outFileName "${coverage_dir}computeMatrix_ChIP-seq.all_ORFs.mat.gz" --numberOfProcessors "${CPU}"
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq.all_ORFs.mat.gz" -out "${image_dir}plotProfile_ChIP-seq.all_ORFs.svg" --regionsLabel "all ORFs" --samplesLabel "KrsL_1" "KrsL_2" "KrsL_3" --numPlotsPerRow 3
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq.all_ORFs.mat.gz" -out "${image_dir}plotProfile_ChIP-seq.all_ORFs2.svg" --regionsLabel "all ORFs" --samplesLabel "KrsL_1" "KrsL_2" "KrsL_3" --perGroup
+
+# TSS
+computeMatrix reference-point -S "${coverage_dir}20-krsl-ChIP_S41_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}44-krsl-ChIP_S44_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}16-krsl-ChIP_S46_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" -R "${genome_dir}all_ORFs.bed" --referencePoint TSS --beforeRegionStartLength 400 --afterRegionStartLength 200 --outFileName "${coverage_dir}computeMatrix_ChIP-seq.all_ORFs_TSS.mat.gz" --numberOfProcessors "${CPU}"
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq.all_ORFs_TSS.mat.gz" -out "${image_dir}plotProfile_ChIP-seq.all_ORFs_TSS.svg" --regionsLabel "all ORFs" --samplesLabel "KrsL_1" "KrsL_2" "KrsL_3" --perGroup
+
+# RNAP vs HelD
+computeMatrix reference-point -S "${coverage_dir}14-RNAP-wt-ex1-3rd_S15_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw"  "${coverage_dir}25-RNAP-wt-ex2-2nd_S16_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}18-RNAP-helD-ex1-3rd_S27_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}29-RNAP-helD-ex2-2nd_S28_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" -R "${genome_dir}all_ORFs.bed" "${genome_dir}RNAP_target_ORFs_shared_w_HelD.bed" "${genome_dir}RNAP_target_ORFs_unique.bed" --referencePoint TSS --beforeRegionStartLength 400 --afterRegionStartLength 600 --outFileName "${coverage_dir}computeMatrix_ChIP-seq_RNAP.all_ORFs_TSS.mat.gz" --numberOfProcessors "${CPU}"
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq_RNAP.all_ORFs_TSS.mat.gz" -out "${image_dir}plotProfile_ChIP-seq_RNAP.all_ORFs_TSS.svg" --regionsLabel "all ORFs" "ORFs with RNAP & HelD peak" "ORFs with RNAP peak only" --samplesLabel "RNAP_IP_WT_1" "RNAP_IP_WT_2" "RNAP_IP_helD_1" "RNAP_IP_helD_2" --refPointLabel "+1 ORF"
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq_RNAP.all_ORFs_TSS.mat.gz" -out "${image_dir}plotProfile_ChIP-seq_RNAP.all_ORFs_TSS_2.svg" --regionsLabel "all ORFs" "ORFs with RNAP & HelD peak" "ORFs with RNAP peak only" --samplesLabel "RNAP_IP_WT_1" "RNAP_IP_WT_2" "RNAP_IP_helD_1" "RNAP_IP_helD_2" --refPointLabel "+1 ORF" --perGroup
+
+# SigA vs HelD
+computeMatrix reference-point -S "${coverage_dir}37-sigA-wt-ex1-5th_S17_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw"  "${coverage_dir}22-sigA-wt-ex2-6th_S18_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}38-sigA-helD-ex1-5th_S29_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" "${coverage_dir}23-sigA-helD-ex2-6th_S30_merged_R1_001.fastq.gz.trim.fastq.gz.bam.bw" -R "${genome_dir}all_ORFs.bed" "${genome_dir}SigA_target_ORFs_shared_w_HelD.bed" "${genome_dir}SigA_target_ORFs_unique.bed" --referencePoint TSS --beforeRegionStartLength 400 --afterRegionStartLength 600 --outFileName "${coverage_dir}computeMatrix_ChIP-seq_SigA.all_ORFs_TSS.mat.gz" --numberOfProcessors "${CPU}"
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq_SigA.all_ORFs_TSS.mat.gz" -out "${image_dir}plotProfile_ChIP-seq_SigA.all_ORFs_TSS.svg" --regionsLabel "all ORFs" "ORFs with SigA & HelD peak" "ORFs with SigA peak only" --samplesLabel "SigA_IP_WT_1" "SigA_IP_WT_2" "SigA_IP_helD_1" "SigA_IP_helD_2" --refPointLabel "+1 ORF"
+
+plotProfile -m "${coverage_dir}computeMatrix_ChIP-seq_SigA.all_ORFs_TSS.mat.gz" -out "${image_dir}plotProfile_ChIP-seq_SigA.all_ORFs_TSS_2.svg" --regionsLabel "all ORFs" "ORFs with SigA & HelD peak" "ORFs with SigA peak only" --samplesLabel "SigA_IP_WT_1" "SigA_IP_WT_2" "SigA_IP_helD_1" "SigA_IP_helD_2" --refPointLabel "+1 ORF" --perGroup
+```
+
+Integrate ChIP-seq peak data with RNA-seq expression data (ArrayExpress accession E-MTAB-7004 ; 3 replicates of WT_EXP: ERR2696389, ERR2696390, ERR2696391)
+
+```{r, eval=TRUE}
+rnaseq <- read.csv('./../20210629_RIP-seq+ChIP-seq/RNA-seq_Ms1_counts_q-filtered_run3.norm.txt', row.names = 1)
+rnaseq <- rowMeans(rnaseq[, c('WT_exp_1', 'WT_exp_2', 'WT_exp_3')])
+rnaseq[rnaseq == 0] <- NA
+rnaseq <- log2(rnaseq)
+
+peaks.RNAP <- read.delim(paste0(peak_dir, 'RNAP_WT_EXP_peaks_CLOSEST.filtered.narrowPeak'), header = FALSE, stringsAsFactors = FALSE)
+peaks.RNAP$locus_tag <- substr(sub('.*locus_tag=', '', peaks.RNAP[, 19]), 1, 10)
+peaks.RNAP$locus_tag <- sub(';', '', peaks.RNAP$locus_tag)
+peaks.KrsL <- read.delim(paste0(peak_dir, 'KrsL_WT_EXP_peaks_CLOSEST.filtered.narrowPeak'), header = FALSE, stringsAsFactors = FALSE)
+peaks.KrsL$locus_tag <- substr(sub('.*locus_tag=', '', peaks.KrsL[, 19]), 1, 10)
+peaks.KrsL$locus_tag <- sub(';', '', peaks.KrsL$locus_tag)
+
+pdf(paste0(image_dir, 'comparisons_with_RNA-seq_WT_EXP_RNAP+KrsL.pdf'))
+
+stripchart(rnaseq[!names(rnaseq) %in% peaks.RNAP$locus_tag], method = 'jitter', 
+           pch = 20, col = rgb(0, 0, 0, 0.2), vertical = TRUE, at = 0.7, group.names = 'RNAP')
+stripchart(rnaseq[!names(rnaseq) %in% peaks.KrsL$locus_tag], method = 'jitter', 
+           pch = 20, col = rgb(0, 0, 0, 0.2), vertical = TRUE, add = TRUE, at = 1.3, group.names = 'KrsL')
+
+stripchart(rnaseq[names(rnaseq) %in% peaks.RNAP$locus_tag], 
+           method = 'jitter', pch = 20, col = rgb(1, 0, 0, 0.2), add = TRUE, vertical = TRUE, at = 0.7)
+stripchart(rnaseq[names(rnaseq) %in% peaks.KrsL$locus_tag], 
+           method = 'jitter', pch = 20, col = rgb(1, 0, 0, 0.2), add = TRUE, vertical = TRUE, at = 1.3)
+mtext('RNAP___KrsL')
+
+boxplot(rnaseq, rnaseq, names = c('RNAP', 'KrsL'), las = 3)
+stripchart(rnaseq[names(rnaseq) %in% peaks.RNAP$locus_tag], col = rgb(0, 0, 1, 0.2), 
+           add = TRUE, vertical = TRUE, method = 'jitter', pch = 20, at = 1)
+stripchart(rnaseq[names(rnaseq) %in% peaks.KrsL$locus_tag], col = rgb(0, 0, 1, 0.2), 
+           add = TRUE, vertical = TRUE, method = 'jitter', pch = 20, at = 2)
+
+for (i in 1:nrow(peaks.RNAP)){
+  peaks.RNAP[i, 'rnaseq'] <- rnaseq[names(rnaseq) == peaks.RNAP[i, 'locus_tag']]
+}
+for (i in 1:nrow(peaks.KrsL)){
+  peaks.KrsL[i, 'rnaseq'] <- rnaseq[names(rnaseq) == peaks.KrsL[i, 'locus_tag']]
+}
+
+plot(log10(peaks.RNAP[, 9]), peaks.RNAP$rnaseq, 
+     pch = 20, col = rgb(0, 0, 0, 0.4), xlab = 'log10(peak q-value)', 
+     ylab = 'log2(norm_expression)', main = 'RNAP peaks and their closest genes')
+abline(lm(peaks.RNAP$rnaseq ~ log10(peaks.RNAP[, 9])))
+cor.test(log10(peaks.RNAP[, 9]), peaks.RNAP$rnaseq, use = 'complete')
+plot(log10(peaks.KrsL[, 9]), peaks.KrsL$rnaseq, 
+     pch = 20, col = rgb(0, 0, 0, 0.4), xlab = 'log10(peak q-value)', 
+     ylab = 'log2(norm_expression)', main = 'KrsL peaks and their closest genes')
+abline(lm(peaks.KrsL$rnaseq ~ log10(peaks.KrsL[, 9])))
+cor.test(log10(peaks.KrsL[, 9]), peaks.KrsL$rnaseq, use = 'complete')
+
+r <- as.data.frame(rnaseq)
+r.RNAP <- as.data.frame(r[rownames(r) %in% peaks.RNAP$locus_tag, ])
+colnames(r.RNAP) <- 'rnaseq'
+r.KrsL <- as.data.frame(r[rownames(r) %in% peaks.KrsL$locus_tag, ])
+colnames(r.KrsL) <- 'rnaseq'
+
+library(ggplot2)
+library(patchwork)
+p1 <- ggplot(r, aes(x = 1, y = rnaseq)) +
+  geom_violin() +
+  labs(x = 'RNAP') + 
+  geom_jitter(data = r.RNAP, alpha = 0.2, aes(x = 1, y = rnaseq), color = 'blue', width = 0.2)
+p2 <- ggplot(r, aes(x = 1, y = rnaseq)) +
+  geom_violin() +
+  labs(x = 'KrsL') + 
+  geom_jitter(data = r.KrsL, alpha = 0.2, aes(x = 1, y = rnaseq), color = 'blue', width = 0.2)
+p1 + p2
+
+plot(peaks.RNAP[, 7], peaks.RNAP$rnaseq, 
+     pch = 20, col = rgb(0, 0, 0, 0.4), xlab = 'coverage enrichment at peak', 
+     ylab = 'log2(norm_expression)', main = 'RNAP peaks and their closest genes')
+abline(lm(peaks.RNAP$rnaseq ~ peaks.RNAP[, 7]))
+cor.test(peaks.RNAP[, 7], peaks.RNAP$rnaseq, use = 'complete')
+plot(peaks.KrsL[, 7], peaks.KrsL$rnaseq, 
+     pch = 20, col = rgb(0, 0, 0, 0.4), xlab = 'coverage enrichment at peak', 
+     ylab = 'log2(norm_expression)', main = 'KrsL peaks and their closest genes')
+abline(lm(peaks.KrsL$rnaseq ~ peaks.KrsL[, 7]))
+cor.test(peaks.KrsL[, 7], peaks.KrsL$rnaseq, use = 'complete')
+
+dev.off()
+```
+
+
+
+
+
+
+
+
+Determine overlaps between target sites of the studied proteins.
+
+```{bash, eval=TRUE}
+source shell_variables_ChIP-seq_Msmegmatis.sh
+
+wc -l "${peak_dir}EXP_CarD_peaks.filtered.narrowPeak" "${peak_dir}EXP_RbpA_peaks.filtered.narrowPeak" "${peak_dir}EXP_HelD_peaks.filtered.narrowPeak"
+bedtools intersect -u -a "${peak_dir}EXP_CarD_peaks.filtered.narrowPeak" -b "${peak_dir}EXP_RbpA_peaks.filtered.narrowPeak" | wc -l
+bedtools intersect -u -b "${peak_dir}EXP_CarD_peaks.filtered.narrowPeak" -a "${peak_dir}EXP_RbpA_peaks.filtered.narrowPeak" | wc -l
+
+bedtools intersect -u -a "${peak_dir}EXP_CarD_peaks.filtered.narrowPeak" -b "${peak_dir}EXP_HelD_peaks.filtered.narrowPeak" | wc -l
+bedtools intersect -u -b "${peak_dir}EXP_CarD_peaks.filtered.narrowPeak" -a "${peak_dir}EXP_HelD_peaks.filtered.narrowPeak" | wc -l
+
+bedtools intersect -u -a "${peak_dir}EXP_RbpA_peaks.filtered.narrowPeak" -b "${peak_dir}EXP_HelD_peaks.filtered.narrowPeak" | wc -l
+bedtools intersect -u -b "${peak_dir}EXP_RbpA_peaks.filtered.narrowPeak" -a "${peak_dir}EXP_HelD_peaks.filtered.narrowPeak" | wc -l
+```
+
+
+***
+
+```{r}
+sessionInfo()
+```
